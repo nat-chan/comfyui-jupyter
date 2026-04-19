@@ -216,13 +216,27 @@ async def jupyter_complete(request: aiohttp.web.Request) -> aiohttp.web.Response
         matches: list[str] = [c.text for c in completions]
         start: int = completions[0].start
         end: int = completions[0].end
+        types: list[dict[str, str]] = [
+            {
+                "text": c.text,
+                "type": c.type or "",
+                "signature": c.signature or "",
+                "start": c.start,
+                "end": c.end,
+            }
+            for c in completions
+        ]
     else:
         matches = []
         start = cursor_pos
         end = cursor_pos
-    return aiohttp.web.json_response(
-        {"matches": matches, "cursor_start": start, "cursor_end": end},
-    )
+        types = []
+    return aiohttp.web.json_response({
+        "matches": matches,
+        "cursor_start": start,
+        "cursor_end": end,
+        "_jupyter_types_experimental": types,
+    })
 
 
 # --- server }}}

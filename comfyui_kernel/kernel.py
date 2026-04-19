@@ -182,10 +182,14 @@ class ComfyUIKernel(Kernel):
             "/jupyter_complete",
             {"code": code, "cursor_pos": cursor_pos},
         )
+        metadata: dict[str, Any] = {}
+        types: list[Any] = result.get("_jupyter_types_experimental", [])
+        if types:
+            metadata["_jupyter_types_experimental"] = types
         return {
             "status": "ok",
             "matches": result.get("matches", []),
             "cursor_start": result.get("cursor_start", cursor_pos),
             "cursor_end": result.get("cursor_end", cursor_pos),
-            "metadata": {},
+            "metadata": metadata,
         }
