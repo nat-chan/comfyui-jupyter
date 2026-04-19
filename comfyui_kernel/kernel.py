@@ -29,7 +29,7 @@ class ComfyUIKernel(Kernel):
         "codemirror_mode": {"name": "ipython", "version": 3},
         "pygments_lexer": "ipython3",
     }
-    banner = "ComfyUI Kernel - Execute Python with access to ComfyUI variables (M)"
+    banner = "ComfyUI Kernel - Execute Python with access to ComfyUI variables"
 
     @property
     def comfyui_url(self) -> str:
@@ -84,7 +84,7 @@ class ComfyUIKernel(Kernel):
             }
 
         if not silent:
-            # stdout を stream として送信
+            # stdout
             stdout_text: str = result.get("stdout", "")
             if stdout_text:
                 self.send_response(
@@ -93,7 +93,7 @@ class ComfyUIKernel(Kernel):
                     {"name": "stdout", "text": stdout_text},
                 )
 
-            # stderr を stream として送信
+            # stderr
             stderr_text: str = result.get("stderr", "")
             if stderr_text:
                 self.send_response(
@@ -102,39 +102,54 @@ class ComfyUIKernel(Kernel):
                     {"name": "stderr", "text": stderr_text},
                 )
 
-            # エラーの場合は traceback を送信
+            # display() 経由のリッチ出力 (matplotlib 図、HTML 等)
+            for dd in result.get("display_data", []):
+                data: dict[str, Any] = dd[0] if isinstance(dd, (list, tuple)) else dd.get("data", dd)
+                metadata: dict[str, Any] = dd[1] if isinstance(dd, (list, tuple)) and len(dd) > 1 else dd.get("metadata", {})
+                self.send_response(
+                    self.iopub_socket,
+                    "display_data",
+                    {"data": data, "metadata": metadata},
+                )
+
+            # 最後の式の結果 (MIME bundle)
+            execute_result: dict[str, Any] | None = result.get("execute_result")
+            if execute_result is not None:
+                self.send_response(
+                    self.iopub_socket,
+                    "execute_result",
+                    {
+                        "execution_count": self.execution_count,
+                        "data": execute_result.get("data", {}),
+                        "metadata": execute_result.get("metadata", {}),
+                    },
+                )
+
+            # エラー
             if result.get("status") == "error":
-                tb_text: str = result.get("traceback", "")
+                traceback_list: list[str] = result.get("traceback", [])
+                if isinstance(traceback_list, str):
+                    traceback_list = traceback_list.splitlines()
                 self.send_response(
                     self.iopub_socket,
                     "error",
                     {
                         "ename": result.get("ename", ""),
                         "evalue": result.get("evalue", ""),
-                        "traceback": tb_text.splitlines(),
-                    },
-                )
-
-            # 最後の式の結果を execute_result として送信
-            result_repr: str | None = result.get("result")
-            if result_repr is not None:
-                self.send_response(
-                    self.iopub_socket,
-                    "execute_result",
-                    {
-                        "execution_count": self.execution_count,
-                        "data": {"text/plain": result_repr},
-                        "metadata": {},
+                        "traceback": traceback_list,
                     },
                 )
 
         if result.get("status") == "error":
+            traceback_list_ret: list[str] = result.get("traceback", [])
+            if isinstance(traceback_list_ret, str):
+                traceback_list_ret = traceback_list_ret.splitlines()
             return {
                 "status": "error",
                 "execution_count": self.execution_count,
                 "ename": result.get("ename", ""),
                 "evalue": result.get("evalue", ""),
-                "traceback": result.get("traceback", "").splitlines(),
+                "traceback": traceback_list_ret,
             }
 
         return {

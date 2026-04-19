@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import ast
+import base64
 import io
 import re
-import sys
-import traceback
 import typing as t
 from abc import ABCMeta
 
 import aiohttp
+from IPython.core.interactiveshell import InteractiveShell
+from IPython.utils.capture import capture_output
 from server import PromptServer  # noqa
 
 NODE_CLASS_MAPPINGS = {}
@@ -111,84 +111,86 @@ routes: aiohttp.web_routedef.RouteTableDef = PromptServer.instance.routes
 app: aiohttp.web_app.Application = PromptServer.instance.app
 
 
-def _execute_code(code: str) -> dict[str, t.Any]:
-    """コードを _user_ns 内で実行し、stdout/stderr/結果を返す。
+import IPython.core.page as _page_mod  # noqa: E402
 
-    最後のstatementが式(Expression)の場合、その値を result として返す。
-    これにより IPython のような "最後の式の値を表示" を実現する。
-    """
-    global _user_ns
 
-    stdout_capture = io.StringIO()
-    stderr_capture = io.StringIO()
-    result_value: t.Any = None
-    status: str = "ok"
-    ename: str = ""
-    evalue: str = ""
-    tb: str = ""
+def _no_pager(strng: str | dict[str, str], start: int = 0, screen_lines: int = 0, pager_cmd: str | None = None) -> None:  # noqa: E501
+    """ページャーの代わりに stdout に直接出力する。"""
+    if isinstance(strng, dict):
+        strng = strng.get("text/plain", "")
+    print(strng)
 
-    # AST で最後の式を分離する
+
+_page_mod.page = _no_pager  # type: ignore[assignment]
+_page_mod.display_page = _no_pager  # type: ignore[assignment]
+
+_shell: InteractiveShell = InteractiveShell.instance(user_ns=_user_ns)
+_OUT_RE: re.Pattern[str] = re.compile(r"^Out\[\d+\]: .*\n?", re.MULTILINE)
+
+
+def _flush_matplotlib_figures() -> list[tuple[dict[str, str], dict[str, t.Any]]]:
+    """開いている matplotlib の figure を PNG にレンダリングして閉じる。"""
     try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        # SyntaxError はそのまま実行側に渡して traceback を取得する
-        old_stdout, old_stderr = sys.stdout, sys.stderr
-        sys.stdout, sys.stderr = stdout_capture, stderr_capture
-        try:
-            exec(compile(code, "<jupyter>", "exec"), _user_ns)
-        except Exception as e:
-            status = "error"
-            ename = type(e).__name__
-            evalue = str(e)
-            tb = traceback.format_exc()
-        finally:
-            sys.stdout, sys.stderr = old_stdout, old_stderr
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return []
+    figs: list[tuple[dict[str, str], dict[str, t.Any]]] = []
+    for fig_num in plt.get_fignums():
+        fig = plt.figure(fig_num)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0)
+        png_b64: str = base64.b64encode(buf.read()).decode("ascii")
+        figs.append((
+            {"image/png": png_b64, "text/plain": repr(fig)},
+            {},
+        ))
+    plt.close("all")
+    return figs
 
+
+def _execute_code(code: str) -> dict[str, t.Any]:
+    """InteractiveShell でコードを実行し、リッチ出力を含む結果を返す。"""
+    with capture_output(stdout=True, stderr=True, display=True) as captured:
+        result = _shell.run_cell(code, silent=False, store_history=True)
+
+    # display() 経由の出力を MIME bundle リストに変換
+    display_data: list[t.Any] = [
+        o._repr_mimebundle_() for o in captured.outputs  # type: ignore[union-attr]
+    ]
+
+    # matplotlib の figure を手動キャプチャ (%matplotlib inline 不要)
+    display_data.extend(_flush_matplotlib_figures())
+
+    # 最後の式の値を MIME bundle に変換
+    execute_result: dict[str, t.Any] | None = None
+    if result.result is not None:
+        fmt_data, fmt_md = _shell.display_formatter.format(result.result)
+        execute_result = {"data": fmt_data, "metadata": fmt_md}
+
+    # stdout から Out[N]: ... 行を除去 (execute_result で別途送るため)
+    stdout: str = _OUT_RE.sub("", captured.stdout)
+
+    if result.success:
         return {
-            "status": status,
-            "stdout": stdout_capture.getvalue(),
-            "stderr": stderr_capture.getvalue(),
-            "result": None,
-            "ename": ename,
-            "evalue": evalue,
-            "traceback": tb,
+            "status": "ok",
+            "stdout": stdout,
+            "stderr": captured.stderr,
+            "display_data": display_data,
+            "execute_result": execute_result,
         }
 
-    # 最後の statement が Expr (式) なら分離して eval する
-    last_expr_node: ast.Expr | None = None
-    if tree.body and isinstance(tree.body[-1], ast.Expr):
-        node = tree.body.pop()
-        assert isinstance(node, ast.Expr)
-        last_expr_node = node
-
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = stdout_capture, stderr_capture
-    try:
-        # 前半を exec
-        if tree.body:
-            exec(compile(tree, "<jupyter>", "exec"), _user_ns)
-        # 最後の式を eval
-        if last_expr_node is not None:
-            result_value = eval(  # noqa: S307
-                compile(ast.Expression(body=last_expr_node.value), "<jupyter>", "eval"),
-                _user_ns,
-            )
-    except Exception as e:
-        status = "error"
-        ename = type(e).__name__
-        evalue = str(e)
-        tb = traceback.format_exc()
-    finally:
-        sys.stdout, sys.stderr = old_stdout, old_stderr
-
+    # エラー時: InteractiveShell はトレースバックを stdout に出力する
+    err: BaseException = result.error_in_exec or result.error_before_exec  # type: ignore[assignment]
     return {
-        "status": status,
-        "stdout": stdout_capture.getvalue(),
-        "stderr": stderr_capture.getvalue(),
-        "result": repr(result_value) if result_value is not None else None,
-        "ename": ename,
-        "evalue": evalue,
-        "traceback": tb,
+        "status": "error",
+        "stdout": "",
+        "stderr": captured.stderr,
+        "display_data": display_data,
+        "execute_result": None,
+        "ename": type(err).__name__,
+        "evalue": str(err),
+        "traceback": stdout.splitlines(),
     }
 
 
