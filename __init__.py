@@ -194,12 +194,35 @@ def _execute_code(code: str) -> dict[str, t.Any]:
     }
 
 
-@routes.post("/jupyter")
-async def jupyter(request: aiohttp.web.Request) -> aiohttp.web.Response:
+@routes.post("/jupyter_execute_code")
+async def jupyter_execute_code(request: aiohttp.web.Request) -> aiohttp.web.Response:
     data = await request.json()
     code: str = data.get("code", "")
     result = _execute_code(code)
     return aiohttp.web.json_response(result)
+
+
+@routes.post("/jupyter_complete")
+async def jupyter_complete(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    from IPython.core.completer import provisionalcompleter, rectify_completions
+
+    data = await request.json()
+    code: str = data.get("code", "")
+    cursor_pos: int = data.get("cursor_pos", 0)
+    with provisionalcompleter():
+        raw = _shell.Completer.completions(code, cursor_pos)
+        completions = list(rectify_completions(code, raw))
+    if completions:
+        matches: list[str] = [c.text for c in completions]
+        start: int = completions[0].start
+        end: int = completions[0].end
+    else:
+        matches = []
+        start = cursor_pos
+        end = cursor_pos
+    return aiohttp.web.json_response(
+        {"matches": matches, "cursor_start": start, "cursor_end": end},
+    )
 
 
 # --- server }}}

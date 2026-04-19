@@ -38,10 +38,10 @@ class ComfyUIKernel(Kernel):
 
         return os.environ.get("COMFYUI_URL", COMFYUI_DEFAULT_URL)
 
-    def _send_to_comfyui(self, code: str) -> dict[str, Any]:
-        """ComfyUI /jupyter エンドポイントにコードを送信して実行結果を受け取る。"""
-        url = f"{self.comfyui_url}/jupyter"
-        payload = json.dumps({"code": code}).encode("utf-8")
+    def _post_comfyui(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
+        """ComfyUI エンドポイントに JSON POST して結果を受け取る。"""
+        url = f"{self.comfyui_url}{path}"
+        payload = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=payload,
@@ -49,6 +49,10 @@ class ComfyUIKernel(Kernel):
         )
         with urllib.request.urlopen(req) as resp:  # noqa: S310
             return json.loads(resp.read().decode("utf-8"))
+
+    def _send_to_comfyui(self, code: str) -> dict[str, Any]:
+        """コード実行用。"""
+        return self._post_comfyui("/jupyter_execute_code", {"code": code})
 
     def do_execute(
         self,
@@ -173,11 +177,15 @@ class ComfyUIKernel(Kernel):
             return {"status": "invalid"}
 
     def do_complete(self, code: str, cursor_pos: int) -> dict[str, Any]:
-        """基本的な補完を提供する。将来的に ComfyUI 側の名前空間に基づく補完も可能。"""
+        """ComfyUI の InteractiveShell に補完を委譲する。"""
+        result = self._post_comfyui(
+            "/jupyter_complete",
+            {"code": code, "cursor_pos": cursor_pos},
+        )
         return {
             "status": "ok",
-            "matches": [],
-            "cursor_start": cursor_pos,
-            "cursor_end": cursor_pos,
+            "matches": result.get("matches", []),
+            "cursor_start": result.get("cursor_start", cursor_pos),
+            "cursor_end": result.get("cursor_end", cursor_pos),
             "metadata": {},
         }
