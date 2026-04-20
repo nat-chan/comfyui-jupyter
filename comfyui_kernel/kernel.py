@@ -1,9 +1,4 @@
-"""ComfyUI Jupyter Kernel.
-
-ComfyUI の /jupyter エンドポイントにコードを転送し、結果を Jupyter に返す。
-ipykernel.kernelbase.Kernel をベースにしており、将来の matplotlib 等の
-リッチ出力拡張にも対応しやすい構造になっている。
-"""
+"""ComfyUI Jupyter Kernel."""
 
 from __future__ import annotations
 
@@ -12,7 +7,6 @@ import urllib.request
 from typing import Any
 
 from ipykernel.kernelbase import Kernel
-
 
 COMFYUI_DEFAULT_URL = "http://127.0.0.1:8188"
 
@@ -108,8 +102,14 @@ class ComfyUIKernel(Kernel):
 
             # display() 経由のリッチ出力 (matplotlib 図、HTML 等)
             for dd in result.get("display_data", []):
-                data: dict[str, Any] = dd[0] if isinstance(dd, (list, tuple)) else dd.get("data", dd)
-                metadata: dict[str, Any] = dd[1] if isinstance(dd, (list, tuple)) and len(dd) > 1 else dd.get("metadata", {})
+                data: dict[str, Any] = (
+                    dd[0] if isinstance(dd, (list, tuple)) else dd.get("data", dd)
+                )
+                metadata: dict[str, Any] = (
+                    dd[1]
+                    if isinstance(dd, (list, tuple)) and len(dd) > 1
+                    else dd.get("metadata", {})
+                )
                 self.send_response(
                     self.iopub_socket,
                     "display_data",

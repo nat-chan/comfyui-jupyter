@@ -114,7 +114,9 @@ app: aiohttp.web_app.Application = PromptServer.instance.app
 import IPython.core.page as _page_mod  # noqa: E402
 
 
-def _no_pager(strng: str | dict[str, str], start: int = 0, screen_lines: int = 0, pager_cmd: str | None = None) -> None:  # noqa: E501
+def _no_pager(
+    strng: str | dict[str, str], start: int = 0, screen_lines: int = 0, pager_cmd: str | None = None
+) -> None:  # noqa: E501
     """ページャーの代わりに stdout に直接出力する。"""
     if isinstance(strng, dict):
         strng = strng.get("text/plain", "")
@@ -126,6 +128,17 @@ _page_mod.display_page = _no_pager  # type: ignore[assignment]
 
 _shell: InteractiveShell = InteractiveShell.instance(user_ns=_user_ns)
 _OUT_RE: re.Pattern[str] = re.compile(r"^Out\[\d+\]: .*\n?", re.MULTILINE)
+
+
+def _sanitize_for_json(obj: t.Any) -> t.Any:
+    """MIME bundle 内の bytes を base64 に変換し JSON シリアライズ可能にする。"""
+    if isinstance(obj, bytes):
+        return base64.b64encode(obj).decode("ascii")
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
 
 
 def _flush_matplotlib_figures() -> list[tuple[dict[str, str], dict[str, t.Any]]]:
@@ -141,10 +154,12 @@ def _flush_matplotlib_figures() -> list[tuple[dict[str, str], dict[str, t.Any]]]
         fig.savefig(buf, format="png", bbox_inches="tight")
         buf.seek(0)
         png_b64: str = base64.b64encode(buf.read()).decode("ascii")
-        figs.append((
-            {"image/png": png_b64, "text/plain": repr(fig)},
-            {},
-        ))
+        figs.append(
+            (
+                {"image/png": png_b64, "text/plain": repr(fig)},
+                {},
+            )
+        )
     plt.close("all")
     return figs
 
@@ -156,7 +171,8 @@ def _execute_code(code: str) -> dict[str, t.Any]:
 
     # display() 経由の出力を MIME bundle リストに変換
     display_data: list[t.Any] = [
-        o._repr_mimebundle_() for o in captured.outputs  # type: ignore[union-attr]
+        o._repr_mimebundle_()
+        for o in captured.outputs  # type: ignore[union-attr]
     ]
 
     # matplotlib の figure を手動キャプチャ (%matplotlib inline 不要)
@@ -199,7 +215,7 @@ async def jupyter_execute_code(request: aiohttp.web.Request) -> aiohttp.web.Resp
     data = await request.json()
     code: str = data.get("code", "")
     result = _execute_code(code)
-    return aiohttp.web.json_response(result)
+    return aiohttp.web.json_response(_sanitize_for_json(result))
 
 
 @routes.post("/jupyter_complete")
@@ -216,7 +232,7 @@ async def jupyter_complete(request: aiohttp.web.Request) -> aiohttp.web.Response
         matches: list[str] = [c.text for c in completions]
         start: int = completions[0].start
         end: int = completions[0].end
-        types: list[dict[str, str]] = [
+        types: list[dict[str, str | int]] = [
             {
                 "text": c.text,
                 "type": c.type or "",
@@ -231,12 +247,14 @@ async def jupyter_complete(request: aiohttp.web.Request) -> aiohttp.web.Response
         start = cursor_pos
         end = cursor_pos
         types = []
-    return aiohttp.web.json_response({
-        "matches": matches,
-        "cursor_start": start,
-        "cursor_end": end,
-        "_jupyter_types_experimental": types,
-    })
+    return aiohttp.web.json_response(
+        {
+            "matches": matches,
+            "cursor_start": start,
+            "cursor_end": end,
+            "_jupyter_types_experimental": types,
+        }
+    )
 
 
 # --- server }}}
