@@ -46,7 +46,7 @@ class ComfyUIKernel(Kernel):
 
     def _send_to_comfyui(self, code: str) -> dict[str, Any]:
         """コード実行用。"""
-        return self._post_comfyui("/jupyter_execute_code", {"code": code})
+        return self._post_comfyui("/comfyui_jupyter/execute_code", {"code": code})
 
     def do_execute(
         self,
@@ -179,7 +179,7 @@ class ComfyUIKernel(Kernel):
     def do_complete(self, code: str, cursor_pos: int) -> dict[str, Any]:
         """ComfyUI の InteractiveShell に補完を委譲する。"""
         result = self._post_comfyui(
-            "/jupyter_complete",
+            "/comfyui_jupyter/complete",
             {"code": code, "cursor_pos": cursor_pos},
         )
         metadata: dict[str, Any] = {}

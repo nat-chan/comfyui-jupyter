@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import re
 import typing as t
 from abc import ABCMeta
+from io import BytesIO
+from pathlib import Path
 
 import aiohttp
+import IPython.core.page as _page_mod
+import torch
+from comfy_api_nodes.util.conversions import (  # noqa
+    bytesio_to_image_tensor,
+    pil_to_bytesio,
+    tensor_to_pil,
+)
 from IPython.core.interactiveshell import InteractiveShell
 from IPython.utils.capture import capture_output
+from PIL import Image
 from server import PromptServer  # noqa
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+WEB_DIRECTORY = "./web"
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
 
 
 """
@@ -21,8 +33,44 @@ https://zenn.dev/4kk11/articles/4e36fc68293bd2
 https://github.com/chrisgoringe/Comfy-Custom-Node-How-To/wiki/api
 """
 
+
+routes: aiohttp.web_routedef.RouteTableDef = PromptServer.instance.routes
+app: aiohttp.web_app.Application = PromptServer.instance.app
+
+
+# ユーザに公開する便利ツールの名前空間
+class tools:
+    tensor_to_pil = tensor_to_pil
+
+    @staticmethod
+    def pil_to_tensor(img: Image.Image, mode: str = "RGB") -> torch.Tensor:
+        """PIL.Image -> ComfyUI image tensor (1, H, W, C), float32, 0-1."""
+        return bytesio_to_image_tensor(pil_to_bytesio(img.convert(mode)), mode=mode)
+
+    @staticmethod
+    def file_to_tensor(path: str | Path, mode: str = "RGB") -> torch.Tensor:
+        """File path -> ComfyUI image tensor (1, H, W, C)."""
+        with open(path, "rb") as f:
+            return bytesio_to_image_tensor(BytesIO(f.read()), mode=mode)
+
+    @staticmethod
+    def trigger_queue(sid: str | None = None, wait: bool = True) -> dict[str, t.Any]:
+        """ブラウザで開いているワークフローの実行をトリガーする。
+
+        Jupyter セルは asyncio.to_thread 経由で別スレッドで実行されるため、
+        run_coroutine_threadsafe でイベントループに処理を投げて完了を待つ。
+
+        Args:
+            sid:  対象クライアントID。省略時は全クライアントにブロードキャスト。
+            wait: True なら推論完了まで待機。False なら即座に返る。
+        """
+        loop = PromptServer.instance.loop
+        future = asyncio.run_coroutine_threadsafe(_trigger_queue_async(sid=sid, wait=wait), loop)
+        return future.result(timeout=660)
+
+
 # コード実行間で変数を保持する名前空間
-_user_ns: dict[str, t.Any] = {}
+_user_ns: dict[str, t.Any] = {"tools": tools}
 
 
 # {{{ node ---
@@ -107,11 +155,6 @@ class JupyterLoad(metaclass=CustomNodeMeta):
 # --- node }}}
 
 # {{{ server ---
-routes: aiohttp.web_routedef.RouteTableDef = PromptServer.instance.routes
-app: aiohttp.web_app.Application = PromptServer.instance.app
-
-
-import IPython.core.page as _page_mod  # noqa: E402
 
 
 def _no_pager(
@@ -164,7 +207,7 @@ def _flush_matplotlib_figures() -> list[tuple[dict[str, str], dict[str, t.Any]]]
     return figs
 
 
-def _execute_code(code: str) -> dict[str, t.Any]:
+def _run_cell(code: str) -> dict[str, t.Any]:
     """InteractiveShell でコードを実行し、リッチ出力を含む結果を返す。"""
     with capture_output(stdout=True, stderr=True, display=True) as captured:
         result = _shell.run_cell(code, silent=False, store_history=True)
@@ -210,16 +253,19 @@ def _execute_code(code: str) -> dict[str, t.Any]:
     }
 
 
-@routes.post("/jupyter_execute_code")
-async def jupyter_execute_code(request: aiohttp.web.Request) -> aiohttp.web.Response:
+@routes.post("/comfyui_jupyter/execute_code")
+async def _execute_code(request: aiohttp.web.Request) -> aiohttp.web.Response:
     data = await request.json()
     code: str = data.get("code", "")
-    result = _execute_code(code)
+    # run_cell は同期関数なので別スレッドで実行し、イベントループをブロックしない。
+    # これにより run_cell 内で tools.trigger_queue(wait=True) を呼んでも
+    # イベントループが WS メッセージを処理できるためデッドロックしない。
+    result = await asyncio.to_thread(_run_cell, code)
     return aiohttp.web.json_response(_sanitize_for_json(result))
 
 
-@routes.post("/jupyter_complete")
-async def jupyter_complete(request: aiohttp.web.Request) -> aiohttp.web.Response:
+@routes.post("/comfyui_jupyter/complete")
+async def _complete(request: aiohttp.web.Request) -> aiohttp.web.Response:
     from IPython.core.completer import provisionalcompleter, rectify_completions
 
     data = await request.json()
@@ -255,6 +301,53 @@ async def jupyter_complete(request: aiohttp.web.Request) -> aiohttp.web.Response
             "_jupyter_types_experimental": types,
         }
     )
+
+
+async def _trigger_queue_async(sid: str | None = None, wait: bool = True) -> dict[str, t.Any]:
+    """trigger_queue の非同期実装。ルートハンドラと tools.trigger_queue の両方から使う。"""
+    if not wait:
+        PromptServer.instance.send_sync("comfyui_jupyter/trigger_queue", {}, sid)
+        return {"status": "ok"}
+
+    # 推論完了まで待機する:
+    # 1. フロントエンドが queuePrompt → POST /prompt → prompt_id が発行される
+    # 2. 実行完了時に executing イベント (node=None) が送られる
+    # その executing イベントを横取りして完了を検知する
+    done: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+
+    original_send = PromptServer.instance.send
+
+    async def _intercept_send(event: str, data: dict[str, t.Any], sid: str | None = None) -> None:
+        await original_send(event, data, sid)
+        if event == "executing" and data.get("node") is None and not done.done():
+            done.set_result(data.get("prompt_id", ""))
+
+    PromptServer.instance.send = _intercept_send  # type: ignore[assignment]
+    try:
+        PromptServer.instance.send_sync("comfyui_jupyter/trigger_queue", {}, sid)
+        prompt_id: str = await asyncio.wait_for(done, timeout=600)
+    except asyncio.TimeoutError:
+        return {"status": "timeout"}
+    finally:
+        PromptServer.instance.send = original_send  # type: ignore[assignment]
+
+    return {"status": "ok", "prompt_id": prompt_id}
+
+
+@routes.post("/comfyui_jupyter/trigger_queue")
+async def _trigger_queue(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """ブラウザで開いているワークフローの実行をトリガーする。
+
+    Parameters (JSON body, すべてオプション):
+        sid:  対象クライアントID。省略時は全クライアントにブロードキャスト。
+        wait: true にすると推論完了まで応答を返さない (デフォルト: true)。
+    """
+    data: dict[str, t.Any] = await request.json() if request.can_read_body else {}
+    sid: str | None = data.get("sid", None)
+    wait: bool = data.get("wait", True)
+    result = await _trigger_queue_async(sid=sid, wait=wait)
+    status_code = 408 if result.get("status") == "timeout" else 200
+    return aiohttp.web.json_response(result, status=status_code)
 
 
 # --- server }}}
