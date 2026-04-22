@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import functools
 import io
 import re
 import threading
@@ -41,40 +40,38 @@ routes: aiohttp.web_routedef.RouteTableDef = PromptServer.instance.routes
 app: aiohttp.web_app.Application = PromptServer.instance.app
 
 
-# tools.wait_prompt が task_done 完了通知を受け取るための仕組み。
-# PromptQueue.task_done を 1 度だけラップし、完了時に対応する threading.Event を set する。
+# tools.wait_prompt が完了通知を受け取るための仕組み。
+# PromptQueue.history を __setitem__ で通知する dict subclass に差し替える。
 _completion_events: dict[str, threading.Event] = {}
 _completion_lock = threading.Lock()
 
 
-def _install_task_done_hook() -> None:
+class _NotifyingHistory(dict[str, t.Any]):
+    """history に prompt_id が追加されたタイミングで待機中の Event を set する dict。"""
+
+    def __setitem__(self, key: str, value: t.Any) -> None:
+        super().__setitem__(key, value)
+        with _completion_lock:
+            event = _completion_events.get(key)
+        if event is not None:
+            event.set()
+
+
+def _install_history_hook() -> None:
     queue = PromptServer.instance.prompt_queue
-    original_task_done = queue.task_done
+    queue.history = _NotifyingHistory(queue.history)
 
-    @functools.wraps(original_task_done)
-    def patched_task_done(
-        item_id: int,
-        history_result: dict[str, t.Any],
-        status: t.Any = None,
-        process_item: t.Callable[..., t.Any] | None = None,
-    ) -> None:
-        # item_id → prompt_id は currently_running から引く (task_done 内で pop される前に参照)
-        with queue.mutex:
-            item = queue.currently_running.get(item_id)
-            prompt_id: str | None = item[1] if item is not None else None
+    # wipe_history は `self.history = {}` で通常 dict に戻してしまうのでラップする。
+    original_wipe = queue.wipe_history
 
-        original_task_done(item_id, history_result, status, process_item)
+    def wipe_history() -> None:
+        original_wipe()
+        queue.history = _NotifyingHistory(queue.history)
 
-        if prompt_id is not None:
-            with _completion_lock:
-                event = _completion_events.get(prompt_id)
-            if event is not None:
-                event.set()
-
-    queue.task_done = patched_task_done
+    queue.wipe_history = wipe_history
 
 
-_install_task_done_hook()
+_install_history_hook()
 
 
 # ユーザに公開する便利ツールの名前空間
@@ -113,8 +110,8 @@ class tools:
     def wait_prompt(prompt_id: str, timeout: float = 600) -> dict[str, t.Any]:
         """prompt_id の実行が完了するまで待機する。
 
-        PromptQueue.task_done をラップし、完了時に threading.Event を set する仕組み
-        を使う。成功/失敗/中断いずれのケースでも task_done が呼ばれるため、全状況で動作する。
+        PromptQueue.history の __setitem__ フックで threading.Event を set する仕組みを使う。
+        成功/失敗/中断いずれのケースでも history に結果が書き込まれるため、全状況で動作する。
 
         Args:
             prompt_id: 待機対象の prompt_id。
@@ -125,17 +122,12 @@ class tools:
         """
         queue = PromptServer.instance.prompt_queue
 
-        # Event を登録する前に history を先行チェック
-        with queue.mutex:
-            if prompt_id in queue.history:
-                return queue.history[prompt_id]
-
         event = threading.Event()
         with _completion_lock:
             _completion_events[prompt_id] = event
 
         try:
-            # 登録前に task_done が呼ばれた可能性を排除するため再チェック
+            # Event 登録前に既に完了済みなら即座に返す。登録後の完了は __setitem__ が拾う。
             with queue.mutex:
                 if prompt_id in queue.history:
                     return queue.history[prompt_id]
