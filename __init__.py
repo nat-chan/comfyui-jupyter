@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import io
 import re
-import time
+import threading
 import typing as t
 import uuid
 from abc import ABCMeta
@@ -40,6 +41,42 @@ routes: aiohttp.web_routedef.RouteTableDef = PromptServer.instance.routes
 app: aiohttp.web_app.Application = PromptServer.instance.app
 
 
+# tools.wait_prompt が task_done 完了通知を受け取るための仕組み。
+# PromptQueue.task_done を 1 度だけラップし、完了時に対応する threading.Event を set する。
+_completion_events: dict[str, threading.Event] = {}
+_completion_lock = threading.Lock()
+
+
+def _install_task_done_hook() -> None:
+    queue = PromptServer.instance.prompt_queue
+    original_task_done = queue.task_done
+
+    @functools.wraps(original_task_done)
+    def patched_task_done(
+        item_id: int,
+        history_result: dict[str, t.Any],
+        status: t.Any = None,
+        process_item: t.Callable[..., t.Any] | None = None,
+    ) -> None:
+        # item_id → prompt_id は currently_running から引く (task_done 内で pop される前に参照)
+        with queue.mutex:
+            item = queue.currently_running.get(item_id)
+            prompt_id: str | None = item[1] if item is not None else None
+
+        original_task_done(item_id, history_result, status, process_item)
+
+        if prompt_id is not None:
+            with _completion_lock:
+                event = _completion_events.get(prompt_id)
+            if event is not None:
+                event.set()
+
+    queue.task_done = patched_task_done
+
+
+_install_task_done_hook()
+
+
 # ユーザに公開する便利ツールの名前空間
 class tools:
     tensor_to_pil = tensor_to_pil
@@ -73,28 +110,44 @@ class tools:
         return future.result(timeout=30)
 
     @staticmethod
-    def wait_prompt(prompt_id: str, timeout: float = 600, poll_interval: float = 0.5) -> dict[str, t.Any]:
-        """prompt_id の実行が完了するまでポーリングで待機する。
+    def wait_prompt(prompt_id: str, timeout: float = 600) -> dict[str, t.Any]:
+        """prompt_id の実行が完了するまで待機する。
 
-        PromptServer.instance.prompt_queue.history を直接参照するため、
-        HTTP リクエストもイベントループも不要。別スレッドから安全に呼べる。
+        PromptQueue.task_done をラップし、完了時に threading.Event を set する仕組み
+        を使う。成功/失敗/中断いずれのケースでも task_done が呼ばれるため、全状況で動作する。
 
         Args:
-            prompt_id:     待機対象の prompt_id。
-            timeout:       最大待機秒数 (デフォルト 600秒)。
-            poll_interval: ポーリング間隔秒数 (デフォルト 0.5秒)。
+            prompt_id: 待機対象の prompt_id。
+            timeout:   最大待機秒数 (デフォルト 600秒)。
 
         Returns:
-            history に格納された結果 dict。
+            history に格納された結果 dict。タイムアウト時は {"status": "timeout"}。
         """
-        deadline = time.monotonic() + timeout
         queue = PromptServer.instance.prompt_queue
-        while time.monotonic() < deadline:
+
+        # Event を登録する前に history を先行チェック
+        with queue.mutex:
+            if prompt_id in queue.history:
+                return queue.history[prompt_id]
+
+        event = threading.Event()
+        with _completion_lock:
+            _completion_events[prompt_id] = event
+
+        try:
+            # 登録前に task_done が呼ばれた可能性を排除するため再チェック
             with queue.mutex:
                 if prompt_id in queue.history:
                     return queue.history[prompt_id]
-            time.sleep(poll_interval)
-        return {"status": "timeout"}
+
+            if not event.wait(timeout):
+                return {"status": "timeout"}
+
+            with queue.mutex:
+                return queue.history.get(prompt_id, {"status": "unknown"})
+        finally:
+            with _completion_lock:
+                _completion_events.pop(prompt_id, None)
 
 
 # コード実行間で変数を保持する名前空間
