@@ -90,6 +90,14 @@ class tools:
             return bytesio_to_image_tensor(BytesIO(f.read()), mode=mode)
 
     @staticmethod
+    def list_sids() -> list[str]:
+        """現在 WebSocket 接続中のクライアント sid を列挙する。
+
+        queue_prompt(sid=...) で対象ブラウザを指定する際の候補取得に使う。
+        """
+        return list(PromptServer.instance.sockets.keys())
+
+    @staticmethod
     def queue_prompt(sid: str | None = None) -> str:
         """ブラウザで開いているワークフローの実行をトリガーし、prompt_id を返す。
 
@@ -173,12 +181,12 @@ class CustomNodeMeta(ABCMeta):
             attrs
             | {
                 "FUNCTION": "main",
-                "CATEGORY": "Paint",
+                "CATEGORY": "comfyui-jupyter",
                 "INPUT_TYPES": _,
             },
         )
         NODE_CLASS_MAPPINGS[name] = new_class
-        NODE_DISPLAY_NAME_MAPPINGS[name] = format_class_name(name) + "🐍"
+        NODE_DISPLAY_NAME_MAPPINGS[name] = format_class_name(name)
         return new_class
 
 
@@ -387,7 +395,11 @@ class QueuePromptError(RuntimeError):
         self.error = error
         # error は {"error": {"type": "prompt_no_outputs", "message": "...", ...}, "node_errors": {...}}
         # のような構造
-        message: str = error.get("error", {}).get("message", str(error)) if isinstance(error.get("error"), dict) else str(error.get("error", error))
+        message: str = (
+            error.get("error", {}).get("message", str(error))
+            if isinstance(error.get("error"), dict)
+            else str(error.get("error", error))
+        )
         super().__init__(message)
 
 
@@ -395,10 +407,10 @@ async def _queue_prompt_async(sid: str | None = None) -> str:
     """ブラウザの queuePrompt をトリガーし、prompt_id を受け取って返す。
 
     流れ:
-      1. request_id を生成し WS でブラウザに送信
-      2. JS が app.queuePrompt(0) → api.queuePrompt のインターセプトで prompt_id を取得
-      3. JS が POST /comfyui_jupyter/queue_prompt_result で結果を返す
-      4. Future が解決されこの関数が返る
+        1. request_id を生成し WS でブラウザに送信
+        2. JS が app.queuePrompt(0) → api.queuePrompt のインターセプトで prompt_id を取得
+        3. JS が POST /comfyui_jupyter/queue_prompt_result で結果を返す
+        4. Future が解決されこの関数が返る
 
     Raises:
         QueuePromptError: validation エラー等で prompt の投入に失敗した場合
@@ -408,12 +420,15 @@ async def _queue_prompt_async(sid: str | None = None) -> str:
     _pending_queue_prompts[request_id] = loop.create_future()
 
     PromptServer.instance.send_sync(
-        "comfyui_jupyter/queue_prompt", {"request_id": request_id}, sid,
+        "comfyui_jupyter/queue_prompt",
+        {"request_id": request_id},
+        sid,
     )
 
     try:
         result: dict[str, t.Any] = await asyncio.wait_for(
-            _pending_queue_prompts[request_id], timeout=30,
+            _pending_queue_prompts[request_id],
+            timeout=30,
         )
     finally:
         _pending_queue_prompts.pop(request_id, None)
