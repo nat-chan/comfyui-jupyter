@@ -4,7 +4,9 @@ import asyncio
 import base64
 import io
 import re
+import time
 import typing as t
+import uuid
 from abc import ABCMeta
 from io import BytesIO
 from pathlib import Path
@@ -54,19 +56,45 @@ class tools:
             return bytesio_to_image_tensor(BytesIO(f.read()), mode=mode)
 
     @staticmethod
-    def trigger_queue(sid: str | None = None, wait: bool = True) -> dict[str, t.Any]:
-        """ブラウザで開いているワークフローの実行をトリガーする。
+    def queue_prompt(sid: str | None = None) -> str:
+        """ブラウザで開いているワークフローの実行をトリガーし、prompt_id を返す。
 
-        Jupyter セルは asyncio.to_thread 経由で別スレッドで実行されるため、
-        run_coroutine_threadsafe でイベントループに処理を投げて完了を待つ。
+        JS 側で api.queuePrompt をインターセプトし、得られた prompt_id を
+        POST /comfyui_jupyter/queue_prompt_result でコールバックする。
 
         Args:
-            sid:  対象クライアントID。省略時は全クライアントにブロードキャスト。
-            wait: True なら推論完了まで待機。False なら即座に返る。
+            sid: 対象クライアントID。省略時は全クライアントにブロードキャスト。
+
+        Returns:
+            prompt_id (str)
         """
         loop = PromptServer.instance.loop
-        future = asyncio.run_coroutine_threadsafe(_trigger_queue_async(sid=sid, wait=wait), loop)
-        return future.result(timeout=660)
+        future = asyncio.run_coroutine_threadsafe(_queue_prompt_async(sid=sid), loop)
+        return future.result(timeout=30)
+
+    @staticmethod
+    def wait_prompt(prompt_id: str, timeout: float = 600, poll_interval: float = 0.5) -> dict[str, t.Any]:
+        """prompt_id の実行が完了するまでポーリングで待機する。
+
+        PromptServer.instance.prompt_queue.history を直接参照するため、
+        HTTP リクエストもイベントループも不要。別スレッドから安全に呼べる。
+
+        Args:
+            prompt_id:     待機対象の prompt_id。
+            timeout:       最大待機秒数 (デフォルト 600秒)。
+            poll_interval: ポーリング間隔秒数 (デフォルト 0.5秒)。
+
+        Returns:
+            history に格納された結果 dict。
+        """
+        deadline = time.monotonic() + timeout
+        queue = PromptServer.instance.prompt_queue
+        while time.monotonic() < deadline:
+            with queue.mutex:
+                if prompt_id in queue.history:
+                    return queue.history[prompt_id]
+            time.sleep(poll_interval)
+        return {"status": "timeout"}
 
 
 # コード実行間で変数を保持する名前空間
@@ -303,51 +331,68 @@ async def _complete(request: aiohttp.web.Request) -> aiohttp.web.Response:
     )
 
 
-async def _trigger_queue_async(sid: str | None = None, wait: bool = True) -> dict[str, t.Any]:
-    """trigger_queue の非同期実装。ルートハンドラと tools.trigger_queue の両方から使う。"""
-    if not wait:
-        PromptServer.instance.send_sync("comfyui_jupyter/trigger_queue", {}, sid)
-        return {"status": "ok"}
-
-    # 推論完了まで待機する:
-    # 1. フロントエンドが queuePrompt → POST /prompt → prompt_id が発行される
-    # 2. 実行完了時に executing イベント (node=None) が送られる
-    # その executing イベントを横取りして完了を検知する
-    done: asyncio.Future[str] = asyncio.get_event_loop().create_future()
-
-    original_send = PromptServer.instance.send
-
-    async def _intercept_send(event: str, data: dict[str, t.Any], sid: str | None = None) -> None:
-        await original_send(event, data, sid)
-        if event == "executing" and data.get("node") is None and not done.done():
-            done.set_result(data.get("prompt_id", ""))
-
-    PromptServer.instance.send = _intercept_send  # type: ignore[assignment]
-    try:
-        PromptServer.instance.send_sync("comfyui_jupyter/trigger_queue", {}, sid)
-        prompt_id: str = await asyncio.wait_for(done, timeout=600)
-    except asyncio.TimeoutError:
-        return {"status": "timeout"}
-    finally:
-        PromptServer.instance.send = original_send  # type: ignore[assignment]
-
-    return {"status": "ok", "prompt_id": prompt_id}
+# queue_prompt: JS からのコールバックで prompt_id (またはエラー) を受け取る
+_pending_queue_prompts: dict[str, asyncio.Future[dict[str, t.Any]]] = {}
 
 
-@routes.post("/comfyui_jupyter/trigger_queue")
-async def _trigger_queue(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    """ブラウザで開いているワークフローの実行をトリガーする。
+class QueuePromptError(RuntimeError):
+    """queue_prompt で validation エラー等が発生した場合に送出される。"""
 
-    Parameters (JSON body, すべてオプション):
-        sid:  対象クライアントID。省略時は全クライアントにブロードキャスト。
-        wait: true にすると推論完了まで応答を返さない (デフォルト: true)。
+    def __init__(self, error: dict[str, t.Any]) -> None:
+        self.error = error
+        # error は {"error": {"type": "prompt_no_outputs", "message": "...", ...}, "node_errors": {...}}
+        # のような構造
+        message: str = error.get("error", {}).get("message", str(error)) if isinstance(error.get("error"), dict) else str(error.get("error", error))
+        super().__init__(message)
+
+
+async def _queue_prompt_async(sid: str | None = None) -> str:
+    """ブラウザの queuePrompt をトリガーし、prompt_id を受け取って返す。
+
+    流れ:
+      1. request_id を生成し WS でブラウザに送信
+      2. JS が app.queuePrompt(0) → api.queuePrompt のインターセプトで prompt_id を取得
+      3. JS が POST /comfyui_jupyter/queue_prompt_result で結果を返す
+      4. Future が解決されこの関数が返る
+
+    Raises:
+        QueuePromptError: validation エラー等で prompt の投入に失敗した場合
     """
-    data: dict[str, t.Any] = await request.json() if request.can_read_body else {}
-    sid: str | None = data.get("sid", None)
-    wait: bool = data.get("wait", True)
-    result = await _trigger_queue_async(sid=sid, wait=wait)
-    status_code = 408 if result.get("status") == "timeout" else 200
-    return aiohttp.web.json_response(result, status=status_code)
+    request_id = uuid.uuid4().hex
+    loop = asyncio.get_event_loop()
+    _pending_queue_prompts[request_id] = loop.create_future()
+
+    PromptServer.instance.send_sync(
+        "comfyui_jupyter/queue_prompt", {"request_id": request_id}, sid,
+    )
+
+    try:
+        result: dict[str, t.Any] = await asyncio.wait_for(
+            _pending_queue_prompts[request_id], timeout=30,
+        )
+    finally:
+        _pending_queue_prompts.pop(request_id, None)
+
+    if "error" in result:
+        raise QueuePromptError(result["error"])
+
+    prompt_id: str | None = result.get("prompt_id")
+    if prompt_id is None:
+        raise QueuePromptError({"error": "prompt_id not received from browser"})
+
+    return prompt_id
+
+
+@routes.post("/comfyui_jupyter/queue_prompt_result")
+async def _queue_prompt_result(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """JS 側からのコールバック。queuePrompt の結果 (prompt_id またはエラー) を受け取る。"""
+    data: dict[str, t.Any] = await request.json()
+    request_id: str | None = data.get("request_id")
+    if request_id is not None:
+        future = _pending_queue_prompts.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(data)
+    return aiohttp.web.json_response({"status": "ok"})
 
 
 # --- server }}}
