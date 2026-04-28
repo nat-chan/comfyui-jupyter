@@ -273,16 +273,15 @@ class JupyterFunction(io.ComfyNode):
                     options=[
                         io.DynamicCombo.Option(
                             "jupyter kernel",
-                            [io.String.Input("func_name", default="")],
+                            [io.String.Input("func_name", default="f")],
                         ),
                         io.DynamicCombo.Option(
                             "embedded code",
                             [
                                 io.String.Input(
                                     "embedded_code",
-                                    default="",
+                                    default="def f(*args, **kwargs):\n    return args, kwargs",
                                     multiline=True,
-                                    placeholder="def f(*args): pass",
                                 ),
                             ],
                         ),

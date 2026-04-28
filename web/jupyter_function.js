@@ -3,12 +3,7 @@ import { app } from "../../scripts/app.js";
 const NODE_TYPE = "JupyterFunction";
 const SLOT_PREFIX = "arg_";
 const NAME_PREFIX = "argname_";
-const TMP_SLOT_PREFIX = "__t_arg_";
-const TMP_NAME_PREFIX = "__t_argname_";
 const ANY_TYPE = "*";
-const NAME_PLACEHOLDER =
-    "The name of the keyword argument (or the positional argument if left blank)";
-const TAG = "[comfyui_jupyter:function]";
 
 // --- helpers ----------------------------------------------------------------
 
@@ -30,17 +25,22 @@ function getArgPairs(node) {
 }
 
 // Recompute every arg slot's display label so the `args[k]` placeholders
-// reflect the *positional* index (i.e. the count of un-named slots above), not
-// the slot's internal index. Modern ComfyUI reads `localized_name` for socket
-// rendering.
+// reflect the *positional* index (the count of un-named slots above), not the
+// slot's internal index. Each paired widget's `label` is updated in lockstep
+// so its visible numbering matches the socket. Modern ComfyUI reads
+// `slot.localized_name` for sockets and `widget.label || widget.name` for
+// widgets; internal `widget.name` (`argname_<slot_idx>`) stays stable for
+// serialization.
 function relabelAllSlots(node) {
     let positional = 0;
     for (const { slot, widget } of getArgPairs(node)) {
         const typed = (widget?.value ?? "").trim();
         if (typed) {
             slot.localized_name = typed;
+            if (widget) widget.label = typed;
         } else {
             slot.localized_name = `args[${positional}]`;
+            if (widget) widget.label = `Bind args[${positional}] to`;
             positional++;
         }
     }
@@ -55,8 +55,6 @@ function attachArgWidgetCallback(node, widget) {
 
 function addArgNameWidget(node, idx) {
     const widget = node.addWidget("text", `${NAME_PREFIX}${idx}`, "", () => {}, {});
-    widget.options = widget.options || {};
-    widget.options.placeholder = NAME_PLACEHOLDER;
     attachArgWidgetCallback(node, widget);
     return widget;
 }
@@ -97,13 +95,11 @@ function normalizeArgs(node) {
     const toRemove = pairs.filter((p, i) => !p.hasLink && i !== trailingPos);
     for (const p of toRemove) removeArgPair(node, p);
 
-    // Renumber survivors contiguously via a two-phase rename to avoid name
-    // collisions while updating sockets and widgets.
+    // Renumber survivors contiguously. Single-pass is safe because survivors
+    // are walked in node.inputs array order and the new indices are 0..N-1
+    // monotonically, so a target name (`arg_i`/`argname_i`) is always free by
+    // the time we assign it.
     const survivors = getArgPairs(node);
-    survivors.forEach((s, i) => {
-        s.slot.name = `${TMP_SLOT_PREFIX}${i}`;
-        if (s.widget) s.widget.name = `${TMP_NAME_PREFIX}${i}`;
-    });
     survivors.forEach((s, i) => {
         s.slot.name = `${SLOT_PREFIX}${i}`;
         if (s.widget) s.widget.name = `${NAME_PREFIX}${i}`;
@@ -170,5 +166,3 @@ app.registerExtension({
         };
     },
 });
-
-console.log(TAG, "extension registered");
