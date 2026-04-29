@@ -1,0 +1,74 @@
+/* Custom DOM widgets for JupyterFunction.
+ *
+ * Layout: a 2-column grid (50/50) so the label and the textbox keep a stable
+ * width regardless of the typed kwarg name's length. The grid follows the
+ * node's resize because each column is `1fr`.
+ *
+ * `padding-left` keeps the label's first character clear of the inline socket
+ * dot rendered in the framework's column-1 by `WidgetLayoutField`.
+ */
+
+.comfy-jupyter-argname-root,
+.comfy-jupyter-header-root {
+    display: grid;
+    grid-template-columns: 3fr 7fr;
+    align-items: center;
+    width: 100%;
+    box-sizing: border-box;
+    gap: 6px;
+    padding-left: 8px;
+}
+
+
+.comfy-jupyter-argname-label {
+    color: var(--p-text-color, #c8c8c8);
+    font-size: 12px;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.comfy-jupyter-argname-input {
+    min-width: 0;
+    box-sizing: border-box;
+    padding: 4px 8px;
+    border-radius: 4px;
+    border: 1px solid var(--p-form-field-border-color, #555);
+    background: var(--p-form-field-background, #2a2a2a);
+    color: var(--p-form-field-color, #ddd);
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    line-height: 1.4;
+}
+
+/* Lift the input background in dark mode — the form-field token resolves to
+ * near-black, which makes the textbox sink visually against the node body.
+ * Light themes get the default lighter token, no override needed. */
+@media (prefers-color-scheme: dark) {
+    .comfy-jupyter-argname-input {
+        background: #2d2d2d;
+    }
+}
+
+.comfy-jupyter-argname-input:focus {
+    border-color: var(
+        --p-form-field-focus-border-color,
+        var(--p-primary-color, #4a90e2)
+    );
+}
+
+/* Header row that labels the two columns underneath. Read-only, muted, and
+ * non-interactive — pointer events are disabled so the framework's drag /
+ * focus handling isn't disturbed. */
+.comfy-jupyter-header-cell {
+    color: var(--p-text-muted-color, #888);
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    user-select: none;
+}

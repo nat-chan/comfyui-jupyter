@@ -1,19 +1,19 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
-import io
 import re
 import threading
 import typing as t
 import uuid
-from abc import ABCMeta
 from io import BytesIO
 from pathlib import Path
 
 import aiohttp
 import IPython.core.page as _page_mod
 import torch
+from comfy_api.latest import ComfyExtension, io
 from comfy_api_nodes.util.conversions import (  # noqa
     bytesio_to_image_tensor,
     pil_to_bytesio,
@@ -23,11 +23,10 @@ from IPython.core.interactiveshell import InteractiveShell
 from IPython.utils.capture import capture_output
 from PIL import Image
 from server import PromptServer  # noqa
+from typing_extensions import override
 
-NODE_CLASS_MAPPINGS = {}
-NODE_DISPLAY_NAME_MAPPINGS = {}
 WEB_DIRECTORY = "./web"
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+__all__ = ["WEB_DIRECTORY", "comfy_entrypoint"]
 
 
 """
@@ -155,82 +154,177 @@ _user_ns: dict[str, t.Any] = {"tools": tools}
 
 
 # {{{ node ---
-def format_class_name(class_name: str) -> str:
-    """先頭以外の大文字の前に空白を挟む"""
-    formatted_name = re.sub(r"(?<!^)(?=[A-Z])", " ", class_name)
-    return formatted_name
-
-
-class CustomNodeMeta(ABCMeta):
-    def __new__(
-        cls,
-        name: str,
-        bases: tuple,
-        attrs: dict,
-    ) -> "CustomNodeMeta":
-        global NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-
-        @classmethod
-        def _(cls):
-            return {"required": cls.REQUIRED}
-
-        new_class = super().__new__(
-            cls,
-            name,
-            bases,
-            attrs
-            | {
-                "FUNCTION": "main",
-                "CATEGORY": "comfyui-jupyter",
-                "INPUT_TYPES": _,
-            },
+class JupyterSave(io.ComfyNode):
+    @classmethod
+    @override
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="JupyterSave",
+            display_name="Jupyter Save",
+            category="comfyui-jupyter",
+            inputs=[
+                io.String.Input("key", default="a", multiline=False),
+                io.AnyType.Input("value"),
+            ],
+            outputs=[],
+            is_output_node=True,
         )
-        NODE_CLASS_MAPPINGS[name] = new_class
-        NODE_DISPLAY_NAME_MAPPINGS[name] = format_class_name(name)
-        return new_class
-
-
-class AnyType(str):
-    def __ne__(self, __value: object) -> bool:
-        return False
-
-
-any = AnyType("*")
-
-
-class JupyterSave(metaclass=CustomNodeMeta):
-    OUTPUT_NODE = True
-    RETURN_TYPES = ()
-    REQUIRED = {
-        "key": ("STRING", {"multiline": False, "default": "a"}),
-        "value": ("*", {}),
-    }
-
-    def main(
-        self,
-        key: str,
-        value: t.Any,
-    ) -> tuple:
-        global _user_ns
-        _user_ns[key] = value
-        return ()
-
-
-class JupyterLoad(metaclass=CustomNodeMeta):
-    OUTPUT_NODE = True
-    RETURN_TYPES = (any,)
-    RETURN_NAMES = ("value",)
-    REQUIRED = {
-        "key": ("STRING", {"multiline": False, "default": "a"}),
-    }
 
     @classmethod
-    def IS_CHANGED(cls, *args, **kwargs):
+    @override
+    def execute(cls, key: str, value: t.Any) -> io.NodeOutput:
+        _user_ns[key] = value
+        return io.NodeOutput()
+
+
+class JupyterLoad(io.ComfyNode):
+    @classmethod
+    @override
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="JupyterLoad",
+            display_name="Jupyter Load",
+            category="comfyui-jupyter",
+            inputs=[
+                io.String.Input("key", default="a", multiline=False),
+            ],
+            outputs=[
+                io.AnyType.Output("value"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    @override
+    def fingerprint_inputs(cls, **kwargs: t.Any) -> float:
         return float("nan")
 
-    def main(self, key) -> tuple[t.Any]:
-        global _user_ns
-        return (_user_ns.get(key, None),)
+    @classmethod
+    @override
+    def execute(cls, key: str) -> io.NodeOutput:
+        return io.NodeOutput(_user_ns.get(key, None))
+
+
+_ARG_KEY_RE = re.compile(r"^arg_(\d+)$")
+_ARG_NAME_KEY_RE = re.compile(r"^argname_(\d+)$")
+
+
+def _resolve_function(func_src: str, func_name: str, embedded_code: str) -> t.Callable[..., t.Any]:
+    if func_src == "jupyter kernel":
+        if not func_name:
+            raise ValueError("func_name is required when func_src is 'jupyter kernel'")
+        candidate = _user_ns.get(func_name)
+        if not callable(candidate):
+            raise ValueError(f"{func_name!r} is not callable in jupyter namespace")
+        return candidate
+    if func_src == "embedded code":
+        tree = ast.parse(embedded_code)
+        func_defs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+        if len(func_defs) != 1:
+            raise ValueError(
+                f"embedded code must define exactly one root-level function, got {len(func_defs)}"
+            )
+        ns: dict[str, t.Any] = {}
+        exec(compile(tree, "<embedded_code>", "exec"), ns, ns)
+        return ns[func_defs[0].name]
+    raise ValueError(f"unknown func_src: {func_src!r}")
+
+
+def _build_call_args(
+    kwargs: dict[str, t.Any],
+) -> tuple[list[t.Any], dict[str, t.Any]]:
+    """Pair `arg_i` sockets with `argname_i` widgets in slot index order.
+
+    Empty `argname_i` -> positional arg, non-empty -> keyword arg with that name.
+
+    With Nodes 2.0 inline rendering each `arg_i` input is paired with its
+    `argname_i` widget (`slot.widget = {name: argname_i}`). When the socket is
+    unconnected, ComfyUI falls back to sending the widget's value as the input
+    value — i.e. `kwargs[arg_i] == kwargs[argname_i]` (both strings). We detect
+    that pattern and skip those slots so unconnected pairs don't leak into the
+    Python call.
+    """
+    indices: dict[int, t.Any] = {}
+    names: dict[int, str] = {}
+    for key, value in kwargs.items():
+        m = _ARG_KEY_RE.match(key)
+        if m is not None:
+            indices[int(m.group(1))] = value
+            continue
+        n = _ARG_NAME_KEY_RE.match(key)
+        if n is not None and isinstance(value, str):
+            names[int(n.group(1))] = value
+    positional: list[t.Any] = []
+    keyword: dict[str, t.Any] = {}
+    for i in sorted(indices):
+        value = indices[i]
+        name = (names.get(i) or "").strip()
+        argname_raw = names.get(i, "")
+        if isinstance(value, str) and value == argname_raw:
+            continue
+        if name:
+            keyword[name] = value
+        else:
+            positional.append(value)
+    return positional, keyword
+
+
+class JupyterFunction(io.ComfyNode):
+    @classmethod
+    @override
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="JupyterFunction",
+            display_name="Jupyter Function",
+            category="comfyui-jupyter",
+            inputs=[
+                io.DynamicCombo.Input(
+                    "func_src",
+                    options=[
+                        io.DynamicCombo.Option(
+                            "jupyter kernel",
+                            [io.String.Input("func_name", default="f")],
+                        ),
+                        io.DynamicCombo.Option(
+                            "embedded code",
+                            [
+                                io.String.Input(
+                                    "embedded_code",
+                                    default="def f(*args, **kwargs):\n    return args, kwargs",
+                                    multiline=True,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            outputs=[io.AnyType.Output("retval")],
+            accept_all_inputs=True,
+        )
+
+    @classmethod
+    @override
+    def execute(
+        cls,
+        func_src: dict[str, t.Any],
+        **kwargs: t.Any,
+    ) -> io.NodeOutput:
+        selection: str = func_src["func_src"]
+        func_name: str = func_src.get("func_name", "") or ""
+        embedded_code: str = func_src.get("embedded_code", "") or ""
+        func = _resolve_function(selection, func_name, embedded_code)
+        positional, keyword = _build_call_args(kwargs)
+        return io.NodeOutput(func(*positional, **keyword))
+
+
+class JupyterExtension(ComfyExtension):
+    @override
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return [JupyterSave, JupyterLoad, JupyterFunction]
+
+
+async def comfy_entrypoint() -> JupyterExtension:
+    return JupyterExtension()
 
 
 # --- node }}}
@@ -274,7 +368,7 @@ def _flush_matplotlib_figures() -> list[tuple[dict[str, str], dict[str, t.Any]]]
     figs: list[tuple[dict[str, str], dict[str, t.Any]]] = []
     for fig_num in plt.get_fignums():
         fig = plt.figure(fig_num)
-        buf = io.BytesIO()
+        buf = BytesIO()
         fig.savefig(buf, format="png", bbox_inches="tight")
         buf.seek(0)
         png_b64: str = base64.b64encode(buf.read()).decode("ascii")
