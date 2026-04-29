@@ -1,32 +1,35 @@
-/* Custom DOM widget for JupyterFunction's `argname_*` rows.
+/* Custom DOM widgets for JupyterFunction.
  *
- * Layout: a flex row with the label on the left and the textbox filling the
- * rest. The label is rendered inside the DOM element because the Vue node
- * template only supplies a label slot for built-in widgets, not for DOM
- * widgets (which mount the user element verbatim).
+ * Layout: a 2-column grid (50/50) so the label and the textbox keep a stable
+ * width regardless of the typed kwarg name's length. The grid follows the
+ * node's resize because each column is `1fr`.
+ *
+ * `padding-left` keeps the label's first character clear of the inline socket
+ * dot rendered in the framework's column-1 by `WidgetLayoutField`.
  */
 
-.comfy-jupyter-argname-root {
-    display: flex;
+.comfy-jupyter-argname-root,
+.comfy-jupyter-header-root {
+    display: grid;
+    grid-template-columns: 3fr 7fr;
     align-items: center;
     width: 100%;
     box-sizing: border-box;
     gap: 6px;
+    padding-left: 8px;
 }
 
+
 .comfy-jupyter-argname-label {
-    flex: 0 0 auto;
     color: var(--p-text-color, #c8c8c8);
     font-size: 12px;
     line-height: 1.4;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 50%;
 }
 
 .comfy-jupyter-argname-input {
-    flex: 1 1 auto;
     min-width: 0;
     box-sizing: border-box;
     padding: 4px 8px;
@@ -40,9 +43,32 @@
     line-height: 1.4;
 }
 
+/* Lift the input background in dark mode — the form-field token resolves to
+ * near-black, which makes the textbox sink visually against the node body.
+ * Light themes get the default lighter token, no override needed. */
+@media (prefers-color-scheme: dark) {
+    .comfy-jupyter-argname-input {
+        background: #2d2d2d;
+    }
+}
+
 .comfy-jupyter-argname-input:focus {
     border-color: var(
         --p-form-field-focus-border-color,
         var(--p-primary-color, #4a90e2)
     );
+}
+
+/* Header row that labels the two columns underneath. Read-only, muted, and
+ * non-interactive — pointer events are disabled so the framework's drag /
+ * focus handling isn't disturbed. */
+.comfy-jupyter-header-cell {
+    color: var(--p-text-muted-color, #888);
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    user-select: none;
 }

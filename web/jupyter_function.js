@@ -3,6 +3,7 @@ import { app } from "../../scripts/app.js";
 const NODE_TYPE = "JupyterFunction";
 const SLOT_PREFIX = "arg_";
 const NAME_PREFIX = "argname_";
+const HEADER_NAME = "_kwargs_header";
 const ANY_TYPE = "*";
 
 // Inject the stylesheet exactly once. import.meta.url resolves to the URL of
@@ -48,22 +49,19 @@ function relabelAllSlots(node) {
     let positional = 0;
     for (const { slot, widget } of getArgPairs(node)) {
         const typed = (widget?.value ?? "").trim();
-        let socketLabel;
-        let widgetLabel;
+        let label;
         if (typed) {
-            socketLabel = typed;
-            widgetLabel = typed;
+            label = typed;
         } else {
-            socketLabel = `args[${positional}]`;
-            widgetLabel = `Bind args[${positional}] to`;
+            label = `args[${positional}]`;
             positional++;
         }
-        slot.localized_name = socketLabel;
+        slot.localized_name = label;
         if (widget) {
-            widget.label = widgetLabel;
+            widget.label = label;
             // DOM widget renders its own label (the Vue layout doesn't supply
             // one for `WidgetDOM`), so push the text into the inline span.
-            widget._setLabelText?.(widgetLabel);
+            widget._setLabelText?.(label);
         }
     }
 }
@@ -143,6 +141,36 @@ function appendEmptyPair(node, idx) {
     addArgNameWidget(node, idx);
     addArgInput(node, idx);
 }
+
+// Read-only DOM widget that labels the two argname columns ("input" /
+// "argument name (blank is positional)"). Inserted once per node, between the
+// schema widgets and the first argname row. Marked `serialize: false` so it
+// doesn't shift the `widgets_values` index on save/load.
+function addKwargsHeader(node) {
+    if (findWidget(node, HEADER_NAME)) return;
+
+    const root = document.createElement("div");
+    root.className = "comfy-jupyter-header-root";
+    const left = document.createElement("span");
+    left.className = "comfy-jupyter-header-cell";
+    left.textContent = "input";
+    const right = document.createElement("span");
+    right.className = "comfy-jupyter-header-cell";
+    right.textContent = "arg name, blank is positional";
+    root.appendChild(left);
+    root.appendChild(right);
+
+    const widget = node.addDOMWidget(HEADER_NAME, "jupyter-kwargs-header", root, {
+        getValue: () => "",
+        setValue: () => {},
+        getMinHeight: () => 18,
+        getMaxHeight: () => 18,
+        hideOnZoom: false,
+    });
+    widget.serialize = false;
+    return widget;
+}
+
 
 function removeArgPair(node, pair) {
     const slotIdx = (node.inputs ?? []).indexOf(pair.slot);
@@ -239,6 +267,7 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             onNodeCreated?.apply(this, arguments);
+            addKwargsHeader(this);
             normalizeArgs(this);
         };
 
@@ -260,9 +289,11 @@ app.registerExtension({
         };
 
         // Pre-add `argname_*` widgets to match saved arg sockets BEFORE the
-        // default configure assigns widgets_values by index.
+        // default configure assigns widgets_values by index. The header widget
+        // is `serialize: false` so it's transparent to the index counting.
         const origConfigure = nodeType.prototype.configure;
         nodeType.prototype.configure = function (data) {
+            addKwargsHeader(this);
             for (const inp of data?.inputs ?? []) {
                 if (typeof inp?.name !== "string") continue;
                 if (!inp.name.startsWith(SLOT_PREFIX)) continue;
