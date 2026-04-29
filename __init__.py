@@ -236,7 +236,13 @@ def _build_call_args(
     """Pair `arg_i` sockets with `argname_i` widgets in slot index order.
 
     Empty `argname_i` -> positional arg, non-empty -> keyword arg with that name.
-    Unconnected sockets are absent from `kwargs` (ComfyUI omits them from the prompt).
+
+    With Nodes 2.0 inline rendering each `arg_i` input is paired with its
+    `argname_i` widget (`slot.widget = {name: argname_i}`). When the socket is
+    unconnected, ComfyUI falls back to sending the widget's value as the input
+    value — i.e. `kwargs[arg_i] == kwargs[argname_i]` (both strings). We detect
+    that pattern and skip those slots so unconnected pairs don't leak into the
+    Python call.
     """
     indices: dict[int, t.Any] = {}
     names: dict[int, str] = {}
@@ -251,11 +257,15 @@ def _build_call_args(
     positional: list[t.Any] = []
     keyword: dict[str, t.Any] = {}
     for i in sorted(indices):
+        value = indices[i]
         name = (names.get(i) or "").strip()
+        argname_raw = names.get(i, "")
+        if isinstance(value, str) and value == argname_raw:
+            continue
         if name:
-            keyword[name] = indices[i]
+            keyword[name] = value
         else:
-            positional.append(indices[i])
+            positional.append(value)
     return positional, keyword
 
 
