@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 import base64
 import re
@@ -209,24 +208,40 @@ _ARG_KEY_RE = re.compile(r"^arg_(\d+)$")
 _ARG_NAME_KEY_RE = re.compile(r"^argname_(\d+)$")
 
 
-def _resolve_function(func_src: str, func_name: str, embedded_code: str) -> t.Callable[..., t.Any]:
+def _resolve_function(
+    func_src: str,
+    func_name: str,
+    embedded_code: str,
+    file_path: str,
+) -> t.Callable[..., t.Any]:
+    if not func_name:
+        raise ValueError("func_name is required")
     if func_src == "jupyter kernel":
-        if not func_name:
-            raise ValueError("func_name is required when func_src is 'jupyter kernel'")
         candidate = _user_ns.get(func_name)
         if not callable(candidate):
             raise ValueError(f"{func_name!r} is not callable in jupyter namespace")
         return candidate
     if func_src == "embedded code":
-        tree = ast.parse(embedded_code)
-        func_defs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
-        if len(func_defs) != 1:
-            raise ValueError(
-                f"embedded code must define exactly one root-level function, got {len(func_defs)}"
-            )
+        # Evaluate the whole embedded source so imports and helper definitions
+        # at module scope take effect, then pick out the function named
+        # `func_name`. This lets users paste long Jupyter scripts verbatim.
         ns: dict[str, t.Any] = {}
-        exec(compile(tree, "<embedded_code>", "exec"), ns, ns)
-        return ns[func_defs[0].name]
+        exec(compile(embedded_code, "<embedded_code>", "exec"), ns, ns)
+        candidate = ns.get(func_name)
+        if not callable(candidate):
+            raise ValueError(f"{func_name!r} is not defined as a callable in embedded code")
+        return candidate
+    if func_src == "from file":
+        if not file_path:
+            raise ValueError("file_path is required when func_src is 'from file'")
+        with open(file_path, encoding="utf-8") as fp:
+            source = fp.read()
+        ns = {}
+        exec(compile(source, file_path, "exec"), ns, ns)
+        candidate = ns.get(func_name)
+        if not callable(candidate):
+            raise ValueError(f"{func_name!r} is not defined as a callable in {file_path}")
+        return candidate
     raise ValueError(f"unknown func_src: {func_src!r}")
 
 
@@ -288,11 +303,23 @@ class JupyterFunction(io.ComfyNode):
                         io.DynamicCombo.Option(
                             "embedded code",
                             [
+                                # `func_name` is in every branch so it stays
+                                # visible regardless of `func_src`; placing it
+                                # before the source widget pins the UI order to
+                                # func_src → func_name → (source widget).
+                                io.String.Input("func_name", default="f"),
                                 io.String.Input(
                                     "embedded_code",
                                     default="def f(*args, **kwargs):\n    return args, kwargs",
                                     multiline=True,
                                 ),
+                            ],
+                        ),
+                        io.DynamicCombo.Option(
+                            "from file",
+                            [
+                                io.String.Input("func_name", default="f"),
+                                io.String.Input("file_path", default="/path/to/file.py"),
                             ],
                         ),
                     ],
@@ -304,6 +331,15 @@ class JupyterFunction(io.ComfyNode):
 
     @classmethod
     @override
+    def fingerprint_inputs(cls, **kwargs: t.Any) -> float:
+        # The visible inputs do not capture every source of change:
+        # `jupyter kernel` may rebind `func_name` to a new body, and
+        # `from file` reads disk content that the cache cannot see. Returning
+        # NaN (which never equals itself) forces ComfyUI to re-execute.
+        return float("nan")
+
+    @classmethod
+    @override
     def execute(
         cls,
         func_src: dict[str, t.Any],
@@ -312,7 +348,8 @@ class JupyterFunction(io.ComfyNode):
         selection: str = func_src["func_src"]
         func_name: str = func_src.get("func_name", "") or ""
         embedded_code: str = func_src.get("embedded_code", "") or ""
-        func = _resolve_function(selection, func_name, embedded_code)
+        file_path: str = func_src.get("file_path", "") or ""
+        func = _resolve_function(selection, func_name, embedded_code, file_path)
         positional, keyword = _build_call_args(kwargs)
         return io.NodeOutput(func(*positional, **keyword))
 
