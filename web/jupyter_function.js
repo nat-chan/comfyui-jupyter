@@ -103,6 +103,12 @@ function addArgNameWidget(node, idx) {
             getMinHeight: () => 28,
             getMaxHeight: () => 28,
             hideOnZoom: false,
+            // Legacy (non-Nodes 2.0) DOM widget overlay renders the element at
+            // `computedHeight - 2*margin`. The default margin is 10, which
+            // would shrink a 28px row to 8px and clip the inline label/input.
+            // Vue (Nodes 2.0) layout doesn't read `margin`, so this is a no-op
+            // there.
+            margin: 0,
         },
     );
     // Setter the relabel pass calls to update the inline label text.
@@ -166,6 +172,10 @@ function addKwargsHeader(node) {
         getMinHeight: () => 18,
         getMaxHeight: () => 18,
         hideOnZoom: false,
+        // See `addArgNameWidget`: without `margin: 0` the legacy DOM widget
+        // overlay would render this 18px row at `18 - 2*10 = -2px`, making the
+        // "input" / "arg name, blank is positional" labels invisible.
+        margin: 0,
     });
     widget.serialize = false;
     return widget;
