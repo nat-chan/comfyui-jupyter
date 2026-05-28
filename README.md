@@ -1,5 +1,7 @@
 # comfyui-jupyter
 
+<img width="1808" height="936" alt="Image" src="https://github.com/user-attachments/assets/e5c5f868-dca3-4f05-86b4-f211dfc2eb9c" />
+
 - ComfyUIとJupyterの間でオブジェクトのやりとり
 - ComfyUIプロセスの"生きた"オブジェクトをJupyter側で対話的に分析できる
 - 任意のPython関数をカスタムノードとして実行できる
