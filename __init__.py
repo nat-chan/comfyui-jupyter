@@ -600,9 +600,34 @@ def _apply_plotly_default() -> None:
         plotly_io.renderers.default = "notebook_connected"
 
 
+def _apply_matplotlib_default() -> None:
+    """Switch matplotlib to the inline backend so `plt.show()` produces output.
+
+    Outside ipykernel, matplotlib defaults to `agg` (a non-interactive
+    raster backend that swallows `plt.show()` silently). The inline
+    backend bundled with ipykernel emits `display_data` containing PNG
+    image data when `plt.show()` is called, which goes through our
+    FakeKernel iopub forwarder to JupyterLab.
+
+    matplotlib reads `MPLBACKEND` on its first import — `setdefault`
+    means the user's own choice is preserved if set. For already-imported
+    matplotlib (without pyplot yet), `matplotlib.use(...)` is a clean
+    swap; if pyplot is also loaded, matplotlib warns but the switch still
+    takes effect.
+    """
+    os.environ.setdefault("MPLBACKEND", "module://matplotlib_inline.backend_inline")
+    mpl = sys.modules.get("matplotlib")
+    if mpl is not None:
+        try:
+            mpl.use("module://matplotlib_inline.backend_inline")
+        except Exception:
+            logger.exception("comfyui_jupyter: matplotlib.use() failed")
+
+
 # (override id, apply function)
 _DEFAULTS: list[tuple[str, t.Callable[[], None]]] = [
     ("plotly", _apply_plotly_default),
+    ("matplotlib", _apply_matplotlib_default),
 ]
 
 
