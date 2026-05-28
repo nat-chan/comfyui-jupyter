@@ -5,7 +5,9 @@ import base64
 import datetime
 import json
 import logging
+import os
 import re
+import sys
 import threading
 import typing as t
 import uuid
@@ -543,6 +545,80 @@ _shell.displayhook.pub_socket = _fake_kernel.iopub_socket
 _shell.displayhook.topic = b"execute_result"
 _shell.display_pub.session = _fake_kernel.session
 _shell.display_pub.pub_socket = _fake_kernel.iopub_socket
+
+
+# --- shell default overrides ---
+#
+# Third-party libraries occasionally publish via MIME types that need a
+# JupyterLab extension we don't bundle (e.g. plotly's
+# `application/vnd.plotly.v1+json` needs `jupyterlab-plotly` or `anywidget`,
+# matplotlib defaults to an Agg backend outside ipykernel, ...). Rather
+# than ship every extension, we pin each library's default to a behaviour
+# that renders against vanilla JupyterLab.
+#
+# Strategy: each override is a function that runs once at module load.
+# Most libraries we care about expose an environment-variable hook they
+# read at their own first import — `PLOTLY_RENDERER`, `MPLBACKEND`, etc.
+# Using `os.environ.setdefault` means: if the user has explicitly chosen
+# the library's native default (because they installed the matching
+# JupyterLab extension and set the env var themselves), we don't clobber
+# it. For libraries already imported when our extension loads, the apply
+# function falls back to mutating the live config directly.
+#
+# Users can also opt out per-name (or fully) without touching env vars
+# the library cares about:
+#
+#     export COMFYUI_JUPYTER_DISABLE_DEFAULTS=plotly,matplotlib
+#     export COMFYUI_JUPYTER_DISABLE_DEFAULTS=all
+#
+# To add a new override: define an apply function below and append it to
+# `_DEFAULTS`.
+
+_disabled_defaults: set[str] = {
+    s.strip().lower()
+    for s in os.environ.get("COMFYUI_JUPYTER_DISABLE_DEFAULTS", "").split(",")
+    if s.strip()
+}
+
+
+def _apply_plotly_default() -> None:
+    """Pin plotly's default renderer to a JupyterLab-extension-free one.
+
+    plotly's auto-detection in a `ZMQInteractiveShell` sets the renderer
+    to `plotly_mimetype`, which produces only `application/vnd.plotly.v1+json`
+    and requires `jupyterlab-plotly` / `anywidget` on the frontend.
+    `notebook_connected` emits `text/html` with a CDN-loaded plotly.js
+    bundle, which JupyterLab renders natively.
+
+    plotly reads `PLOTLY_RENDERER` once when `plotly.io` first imports.
+    For not-yet-imported plotly: `setdefault` wins. For already-imported
+    plotly: assign through to the live config.
+    """
+    os.environ.setdefault("PLOTLY_RENDERER", "notebook_connected")
+    plotly_io = sys.modules.get("plotly.io")
+    if plotly_io is not None:
+        plotly_io.renderers.default = "notebook_connected"
+
+
+# (override id, apply function)
+_DEFAULTS: list[tuple[str, t.Callable[[], None]]] = [
+    ("plotly", _apply_plotly_default),
+]
+
+
+def _apply_all_defaults() -> None:
+    if "all" in _disabled_defaults:
+        return
+    for name, apply_fn in _DEFAULTS:
+        if name in _disabled_defaults:
+            continue
+        try:
+            apply_fn()
+        except Exception:
+            logger.exception("comfyui_jupyter: %s default override failed", name)
+
+
+_apply_all_defaults()
 
 
 def _run_cell_for_kernel(
