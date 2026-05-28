@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime
+import json
+import logging
 import re
 import threading
 import typing as t
@@ -10,7 +13,8 @@ from io import BytesIO
 from pathlib import Path
 
 import aiohttp
-import IPython.core.page as _page_mod
+import comm
+import comm.base_comm
 import torch
 from comfy_api.latest import ComfyExtension, io
 from comfy_api_nodes.util.conversions import (  # noqa
@@ -18,11 +22,13 @@ from comfy_api_nodes.util.conversions import (  # noqa
     pil_to_bytesio,
     tensor_to_pil,
 )
-from IPython.core.interactiveshell import InteractiveShell
-from IPython.utils.capture import capture_output
+from ipykernel.zmqshell import ZMQInteractiveShell
+from jupyter_client.session import Session
 from PIL import Image
 from server import PromptServer  # noqa
 from typing_extensions import override
+
+logger = logging.getLogger(__name__)
 
 WEB_DIRECTORY = "./web"
 __all__ = ["WEB_DIRECTORY", "comfy_entrypoint"]
@@ -368,129 +374,221 @@ async def comfy_entrypoint() -> JupyterExtension:
 
 # {{{ server ---
 
-
-def _no_pager(
-    strng: str | dict[str, str], start: int = 0, screen_lines: int = 0, pager_cmd: str | None = None
-) -> None:  # noqa: E501
-    """ページャーの代わりに stdout に直接出力する。"""
-    if isinstance(strng, dict):
-        strng = strng.get("text/plain", "")
-    print(strng)
-
-
-_page_mod.page = _no_pager  # type: ignore[assignment]
-_page_mod.display_page = _no_pager  # type: ignore[assignment]
-
-_shell: InteractiveShell = InteractiveShell.instance(user_ns=_user_ns)
-_OUT_RE: re.Pattern[str] = re.compile(r"^Out\[\d+\]: .*\n?", re.MULTILINE)
+# Cross-process kernel transparency.
+#
+# The comfyui_kernel process (separate Python venv, what JupyterLab actually
+# connects to) forwards every shell request to ComfyUI over a single
+# `/comfyui_jupyter/proxy` WebSocket. Code runs against the InteractiveShell
+# below — same process as PromptServer, so tensors and `tools.*` retain
+# zero-copy access. ipywidgets / plotly / matplotlib publish iopub messages
+# via the FakeKernel infrastructure; those messages travel back over the
+# same WS and the comfyui_kernel re-emits them on its real iopub socket.
 
 
-def _sanitize_for_json(obj: t.Any) -> t.Any:
-    """MIME bundle 内の bytes を base64 に変換し JSON シリアライズ可能にする。"""
+# --- FakeKernel: ipywidgets-shaped attributes mounted on a non-kernel shell ---
+
+
+_kernel_ws: aiohttp.web.WebSocketResponse | None = None
+_kernel_ws_loop: asyncio.AbstractEventLoop | None = None
+_kernel_ws_lock = threading.Lock()
+
+
+def _json_default(obj: t.Any) -> str:
+    if isinstance(obj, datetime.datetime):
+        return obj.isoformat()
     if isinstance(obj, bytes):
         return base64.b64encode(obj).decode("ascii")
-    if isinstance(obj, dict):
-        return {k: _sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(v) for v in obj]
-    return obj
+    return str(obj)
 
 
-def _flush_matplotlib_figures() -> list[tuple[dict[str, str], dict[str, t.Any]]]:
-    """開いている matplotlib の figure を PNG にレンダリングして閉じる。"""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return []
-    figs: list[tuple[dict[str, str], dict[str, t.Any]]] = []
-    for fig_num in plt.get_fignums():
-        fig = plt.figure(fig_num)
-        buf = BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight")
-        buf.seek(0)
-        png_b64: str = base64.b64encode(buf.read()).decode("ascii")
-        figs.append(
-            (
-                {"image/png": png_b64, "text/plain": repr(fig)},
-                {},
-            )
+def _kernel_ws_send(payload: dict[str, t.Any]) -> None:
+    """Forward `payload` to the attached kernel from any thread (best-effort).
+
+    Drops silently when no kernel is attached — widgets created without a
+    listening kernel just never become visible, which is harmless.
+    """
+    with _kernel_ws_lock:
+        ws = _kernel_ws
+        loop = _kernel_ws_loop
+    if ws is None or loop is None:
+        return
+    encoded = json.dumps(payload, default=_json_default)
+    asyncio.run_coroutine_threadsafe(ws.send_str(encoded), loop)
+
+
+class _WSSocket:
+    """Duck-typed ZMQ socket for `jupyter_client.Session.send`.
+
+    `Session.send` serializes the message into wire parts and then calls
+    `socket.send_multipart(parts)`. We deserialize the parts back into a
+    logical message dict (using the same session) and forward over WS as
+    JSON so the kernel side can re-sign and re-emit with its own session.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def send_multipart(
+        self,
+        parts: list[bytes],
+        copy: bool = False,  # noqa: ARG002
+        track: bool = False,  # noqa: ARG002
+    ) -> None:
+        try:
+            _idents, msg_parts = self._session.feed_identities(parts, copy=True)
+            msg = self._session.deserialize(msg_parts, content=True, copy=True)
+        except Exception:
+            logger.exception("comfyui_jupyter: WSSocket failed to decode parts")
+            return
+        buffers = msg.get("buffers") or []
+        _kernel_ws_send(
+            {
+                "op": "iopub",
+                "msg_type": msg["header"]["msg_type"],
+                "header": msg["header"],
+                "parent_header": msg.get("parent_header") or {},
+                "metadata": msg.get("metadata") or {},
+                "content": msg.get("content") or {},
+                "buffers": [base64.b64encode(bytes(b)).decode("ascii") for b in buffers],
+            }
         )
-    plt.close("all")
-    return figs
 
 
-def _run_cell(code: str) -> dict[str, t.Any]:
-    """InteractiveShell でコードを実行し、リッチ出力を含む結果を返す。"""
-    with capture_output(stdout=True, stderr=True, display=True) as captured:
-        result = _shell.run_cell(code, silent=False, store_history=True)
+class _FakeKernel:
+    """The 4 attributes ipywidgets and the IPython publisher chain require."""
 
-    # display() 経由の出力を MIME bundle リストに変換
-    display_data: list[t.Any] = [
-        o._repr_mimebundle_()
-        for o in captured.outputs  # type: ignore[union-attr]
-    ]
+    def __init__(self) -> None:
+        # Empty signing key — Session won't sign; receiver doesn't verify.
+        self.session = Session()
+        self.iopub_socket = _WSSocket(self.session)
+        self._parent: dict[str, t.Any] = {}
+        self.comm_manager = comm.base_comm.CommManager()
 
-    # matplotlib の figure を手動キャプチャ (%matplotlib inline 不要)
-    display_data.extend(_flush_matplotlib_figures())
+    def get_parent(self, channel: str | None = None) -> dict[str, t.Any]:  # noqa: ARG002
+        return self._parent
 
-    # 最後の式の値を MIME bundle に変換
-    execute_result: dict[str, t.Any] | None = None
-    if result.result is not None:
-        fmt_data, fmt_md = _shell.display_formatter.format(result.result)
-        execute_result = {"data": fmt_data, "metadata": fmt_md}
+    def set_parent(self, parent_msg: dict[str, t.Any] | None) -> None:
+        self._parent = parent_msg or {}
 
-    # stdout から Out[N]: ... 行を除去 (execute_result で別途送るため)
-    stdout: str = _OUT_RE.sub("", captured.stdout)
 
+class _ForwardingComm(comm.base_comm.BaseComm):
+    """Comm whose `publish_msg` writes via FakeKernel.session/iopub_socket."""
+
+    def publish_msg(  # type: ignore[override]
+        self,
+        msg_type: str,
+        data: dict[str, t.Any] | None = None,
+        metadata: dict[str, t.Any] | None = None,
+        buffers: list[bytes] | None = None,
+        **keys: t.Any,
+    ) -> None:
+        data = data if data is not None else {}
+        metadata = metadata if metadata is not None else {}
+        content = dict(keys)
+        content["comm_id"] = self.comm_id
+        content["data"] = data
+        if msg_type == "comm_open":
+            content["target_name"] = self.target_name
+            if self.target_module:
+                content["target_module"] = self.target_module
+        _fake_kernel.session.send(
+            _fake_kernel.iopub_socket,
+            msg_type,
+            content,
+            metadata=metadata,
+            parent=_fake_kernel.get_parent(),
+            ident=self.topic,
+            buffers=buffers,
+        )
+
+
+_fake_kernel = _FakeKernel()
+
+
+def _our_create_comm(
+    target_name: str = "",
+    data: dict[str, t.Any] | None = None,
+    metadata: dict[str, t.Any] | None = None,
+    buffers: list[bytes] | None = None,
+    **kwargs: t.Any,
+) -> _ForwardingComm:
+    return _ForwardingComm(
+        target_name=target_name, data=data, metadata=metadata, buffers=buffers, **kwargs
+    )
+
+
+def _our_get_comm_manager() -> comm.base_comm.CommManager:
+    return _fake_kernel.comm_manager
+
+
+# Replace `comm` package singletons BEFORE any code imports `ipywidgets`.
+# `ipykernel.ipkernel` would otherwise rebind these to its own factory,
+# which targets a Kernel.instance() that does not exist in this process.
+comm.create_comm = _our_create_comm
+comm.get_comm_manager = _our_get_comm_manager
+
+
+# --- shell setup ---
+
+
+_shell: ZMQInteractiveShell = ZMQInteractiveShell.instance(user_ns=_user_ns)
+# `Output` widget (and a few other things) read shell.kernel for parent-
+# header threading. Point it at our fake.
+_shell.kernel = _fake_kernel
+# Wire publishing chain (displayhook = `_` value, display_pub = display(),
+# pyout = legacy) so iopub messages emitted by the shell flow through our
+# FakeKernel session/socket pair.
+_shell.displayhook.session = _fake_kernel.session
+_shell.displayhook.pub_socket = _fake_kernel.iopub_socket
+_shell.displayhook.topic = b"execute_result"
+_shell.display_pub.session = _fake_kernel.session
+_shell.display_pub.pub_socket = _fake_kernel.iopub_socket
+
+
+def _run_cell_for_kernel(
+    code: str,
+    parent_header: dict[str, t.Any],
+    silent: bool,
+    store_history: bool,
+) -> dict[str, t.Any]:
+    """Run a cell under a parent_header so iopub correlates to the right cell."""
+    parent_msg = {"header": parent_header} if parent_header else {}
+    _fake_kernel.set_parent(parent_msg)
+    _shell.displayhook.set_parent(parent_msg)
+    _shell.display_pub.set_parent(parent_msg)
+    try:
+        result = _shell.run_cell(code, silent=silent, store_history=store_history)
+    finally:
+        _fake_kernel.set_parent({})
+    exec_count = _shell.execution_count - 1 if store_history else 0
     if result.success:
         return {
             "status": "ok",
-            "stdout": stdout,
-            "stderr": captured.stderr,
-            "display_data": display_data,
-            "execute_result": execute_result,
+            "execution_count": exec_count,
+            "payload": [],
+            "user_expressions": {},
         }
-
-    # エラー時: InteractiveShell はトレースバックを stdout に出力する
-    err: BaseException = result.error_in_exec or result.error_before_exec  # type: ignore[assignment]
+    err = result.error_in_exec or result.error_before_exec
     return {
         "status": "error",
-        "stdout": "",
-        "stderr": captured.stderr,
-        "display_data": display_data,
-        "execute_result": None,
-        "ename": type(err).__name__,
-        "evalue": str(err),
-        "traceback": stdout.splitlines(),
+        "execution_count": exec_count,
+        "ename": type(err).__name__ if err is not None else "Error",
+        "evalue": str(err) if err is not None else "",
+        "traceback": [],
     }
 
 
-@routes.post("/comfyui_jupyter/execute_code")
-async def _execute_code(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    data = await request.json()
-    code: str = data.get("code", "")
-    # run_cell は同期関数なので別スレッドで実行し、イベントループをブロックしない。
-    # これにより run_cell 内で tools.trigger_queue(wait=True) を呼んでも
-    # イベントループが WS メッセージを処理できるためデッドロックしない。
-    result = await asyncio.to_thread(_run_cell, code)
-    return aiohttp.web.json_response(_sanitize_for_json(result))
-
-
-@routes.post("/comfyui_jupyter/complete")
-async def _complete(request: aiohttp.web.Request) -> aiohttp.web.Response:
+def _complete_for_kernel(code: str, cursor_pos: int) -> dict[str, t.Any]:
     from IPython.core.completer import provisionalcompleter, rectify_completions
 
-    data = await request.json()
-    code: str = data.get("code", "")
-    cursor_pos: int = data.get("cursor_pos", 0)
     with provisionalcompleter():
         raw = _shell.Completer.completions(code, cursor_pos)
         completions = list(rectify_completions(code, raw))
     if completions:
-        matches: list[str] = [c.text for c in completions]
-        start: int = completions[0].start
-        end: int = completions[0].end
-        types: list[dict[str, str | int]] = [
+        matches = [c.text for c in completions]
+        start = completions[0].start
+        end = completions[0].end
+        types = [
             {
                 "text": c.text,
                 "type": c.type or "",
@@ -501,18 +599,94 @@ async def _complete(request: aiohttp.web.Request) -> aiohttp.web.Response:
             for c in completions
         ]
     else:
-        matches = []
-        start = cursor_pos
-        end = cursor_pos
-        types = []
-    return aiohttp.web.json_response(
-        {
-            "matches": matches,
-            "cursor_start": start,
-            "cursor_end": end,
-            "_jupyter_types_experimental": types,
-        }
-    )
+        matches, start, end, types = [], cursor_pos, cursor_pos, []
+    return {
+        "status": "ok",
+        "matches": matches,
+        "cursor_start": start,
+        "cursor_end": end,
+        "metadata": {"_jupyter_types_experimental": types},
+    }
+
+
+# --- WS endpoint ---
+
+
+@routes.get("/comfyui_jupyter/proxy")
+async def _kernel_proxy_ws(request: aiohttp.web.Request) -> aiohttp.web.WebSocketResponse:
+    """The comfyui_kernel process connects here on startup.
+
+    A single attachment at a time — if a fresh kernel connects while one is
+    already attached, we replace the reference. Old connection will close on
+    next send when the new one takes over.
+    """
+    global _kernel_ws, _kernel_ws_loop
+    ws = aiohttp.web.WebSocketResponse(heartbeat=30, max_msg_size=0)
+    await ws.prepare(request)
+    with _kernel_ws_lock:
+        _kernel_ws = ws
+        _kernel_ws_loop = asyncio.get_event_loop()
+    logger.info("comfyui_jupyter proxy: kernel attached from %s", request.remote)
+    try:
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    payload = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    logger.warning("comfyui_jupyter proxy: bad JSON inbound")
+                    continue
+                asyncio.create_task(_handle_proxy_msg(ws, payload))
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                logger.warning("comfyui_jupyter proxy: ws error %s", ws.exception())
+    finally:
+        with _kernel_ws_lock:
+            if _kernel_ws is ws:
+                _kernel_ws = None
+                _kernel_ws_loop = None
+        logger.info("comfyui_jupyter proxy: kernel detached")
+    return ws
+
+
+async def _handle_proxy_msg(
+    ws: aiohttp.web.WebSocketResponse,
+    payload: dict[str, t.Any],
+) -> None:
+    op = payload.get("op")
+    if op == "execute":
+        rid = payload.get("id")
+        code: str = payload.get("code", "")
+        silent: bool = bool(payload.get("silent", False))
+        store_history: bool = bool(payload.get("store_history", True))
+        parent_header: dict[str, t.Any] = payload.get("parent_header") or {}
+        content = await asyncio.to_thread(
+            _run_cell_for_kernel,
+            code,
+            parent_header,
+            silent,
+            store_history,
+        )
+        await ws.send_str(
+            json.dumps({"op": "execute_reply", "id": rid, "content": content}, default=_json_default)
+        )
+    elif op == "complete":
+        rid = payload.get("id")
+        code = payload.get("code", "")
+        cursor_pos = int(payload.get("cursor_pos", 0))
+        content = await asyncio.to_thread(_complete_for_kernel, code, cursor_pos)
+        await ws.send_str(
+            json.dumps({"op": "complete_reply", "id": rid, "content": content}, default=_json_default)
+        )
+    elif op in ("comm_open", "comm_msg", "comm_close"):
+        msg = payload.get("msg") or {}
+        buffers_b64 = msg.get("buffers") or []
+        msg["buffers"] = [base64.b64decode(b) for b in buffers_b64]
+        handler = getattr(_fake_kernel.comm_manager, op)
+        try:
+            handler(None, b"", msg)
+        except Exception:
+            logger.exception("comfyui_jupyter proxy: %s dispatch failed", op)
+    else:
+        logger.warning("comfyui_jupyter proxy: unknown op %r", op)
 
 
 # queue_prompt: JS からのコールバックで prompt_id (またはエラー) を受け取る
