@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import datetime
 import json
 import logging
@@ -646,6 +647,68 @@ def _apply_all_defaults() -> None:
 _apply_all_defaults()
 
 
+class _KernelStream:
+    """File-like that batches writes between `flush()` calls into `stream` iopub.
+
+    Installed via `contextlib.redirect_stdout` / `redirect_stderr` while a cell
+    runs. `print()` calls write the payload + newline then trigger flush (due
+    to line buffering), so each `print()` emits exactly one iopub message.
+    Carriage-return-driven output (e.g. tqdm) still arrives in real time
+    because each tqdm step explicitly flushes after writing the bar.
+
+    Only active during `_run_cell_for_kernel`; outside of cell execution
+    ComfyUI's own `print()` keeps going to the real terminal.
+    """
+
+    encoding = "utf-8"
+
+    def __init__(self, name: str) -> None:
+        self.name = name  # "stdout" or "stderr"
+        self._buf: list[str] = []
+        self.closed = False
+
+    def write(self, text: str) -> int:
+        if not isinstance(text, str):
+            text = str(text)
+        if not text:
+            return 0
+        self._buf.append(text)
+        # Line-buffer: emit as soon as a newline lands, so sequential `print()`
+        # calls show up live in JupyterLab instead of arriving as one big chunk
+        # at cell end.
+        if "\n" in text:
+            self.flush()
+        return len(text)
+
+    def writelines(self, lines: t.Iterable[str]) -> None:
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        if not self._buf:
+            return
+        text = "".join(self._buf)
+        self._buf.clear()
+        try:
+            _fake_kernel.session.send(
+                _fake_kernel.iopub_socket,
+                "stream",
+                content={"name": self.name, "text": text},
+                parent=_fake_kernel.get_parent(),
+            )
+        except Exception:
+            logger.exception("comfyui_jupyter: %s stream flush failed", self.name)
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+
 def _run_cell_for_kernel(
     code: str,
     parent_header: dict[str, t.Any],
@@ -657,8 +720,20 @@ def _run_cell_for_kernel(
     _fake_kernel.set_parent(parent_msg)
     _shell.displayhook.set_parent(parent_msg)
     _shell.display_pub.set_parent(parent_msg)
+    stdout_stream = _KernelStream("stdout")
+    stderr_stream = _KernelStream("stderr")
     try:
-        result = _shell.run_cell(code, silent=silent, store_history=store_history)
+        with (
+            contextlib.redirect_stdout(stdout_stream),
+            contextlib.redirect_stderr(stderr_stream),
+        ):
+            try:
+                result = _shell.run_cell(code, silent=silent, store_history=store_history)
+            finally:
+                # Flush whatever the cell wrote after the last newline (e.g. an
+                # incomplete tqdm bar or a `print("...", end="")`).
+                stdout_stream.flush()
+                stderr_stream.flush()
     finally:
         _fake_kernel.set_parent({})
     exec_count = _shell.execution_count - 1 if store_history else 0
